@@ -171,7 +171,7 @@ cd rust && cargo test --release    # unit tests plus a differential test against
 ./test/run.sh                      # end-to-end against CINC Server in Docker
 ```
 
-`test/run.sh` builds the engine, starts a CINC Server container (about ten minutes the first time), converges the cookbook twice, runs the server's depsolver API tests, removes the cookbook and runs them again. It expects exactly the three wording failures with depsolve installed and none after removal.
+`test/run.sh` builds the engine, starts a CINC Server container (about ten minutes the first time), converges the cookbook twice, runs the server's depsolver API tests, removes the cookbook and runs them again. With depsolve installed it requires that the only failures are the three wording tests and that each response differs from the expected one in the `message` alone; after removal it requires none.
 
 `rust/src/bin/depsolve.rs` is a command-line front end for trying the engine directly. It reads a problem as JSON:
 

@@ -6,15 +6,16 @@
 #   3. runs the server's depsolver API tests (oc-chef-pedant) against the new worker
 #   4. converges recipe[depsolve::remove] and reruns the tests against the stock worker
 #
-# With the depsolve worker, exactly three pedant examples are expected to fail: they
-# assert the stock solver's error wording word for word (see README, "Differences").
+# With the depsolve worker, three pedant examples fail because they assert the stock
+# solver's error wording word for word (see README, "Differences"). The test checks
+# that those three are the only failures and that each differs only in the message.
 # The first server start takes around ten minutes under amd64 emulation.
 set -eu
 cd "$(dirname "$0")/.."
 
 container=depsolve-cinc-server
 image=depsolve-cinc-server
-expected_wording_failures=3
+output=$(mktemp)
 
 ./build.sh
 
@@ -46,10 +47,9 @@ converge() {
     --json-attributes /tmp/depsolve-test/attributes.json --override-runlist "$1" --log_level warn
 }
 
-# Prints the number of failing pedant depsolver examples.
-pedant_failures() {
-  docker exec "$container" cinc-server-ctl test --focus depsolver 2>&1 |
-    sed 's/\x1b\[[0-9;]*m//g' | sed -n 's/^[0-9]* examples, \([0-9]*\) failures.*/\1/p' | tail -1
+# Runs the server's depsolver API tests and prints their output, colour codes removed.
+pedant() {
+  docker exec "$container" cinc-server-ctl test --focus depsolver 2>&1 | sed 's/\x1b\[[0-9;]*m//g' || true
 }
 
 echo "== converge recipe[depsolve]"
@@ -60,16 +60,27 @@ echo "$second"
 echo "$second" | grep -q "0/[0-9]* resources updated" || { echo "second converge was not idempotent" >&2; exit 1; }
 
 echo "== pedant depsolver tests, depsolve worker"
-failures=$(pedant_failures)
-echo "failures: ${failures:-unknown} (expected $expected_wording_failures)"
-[ "$failures" = "$expected_wording_failures" ] || exit 1
+# Only the three wording examples may fail, and only on the message (see wording_failures.rb).
+pedant > "$output"
+ruby_in_container=/opt/cinc-project/embedded/bin/ruby
+docker cp test/wording_failures.rb "$container:/tmp/depsolve-test/wording_failures.rb" >/dev/null
+docker cp "$output" "$container:/tmp/depsolve-test/pedant.log" >/dev/null
+docker exec "$container" "$ruby_in_container" /tmp/depsolve-test/wording_failures.rb /tmp/depsolve-test/pedant.log || {
+  echo "full test output: $output" >&2
+  exit 1
+}
 
 echo "== converge recipe[depsolve::remove]"
 converge 'recipe[depsolve::remove]'
 
 echo "== pedant depsolver tests, stock worker"
-failures=$(pedant_failures)
-echo "failures: ${failures:-unknown} (expected 0)"
-[ "$failures" = "0" ] || exit 1
+pedant > "$output"
+summary=$(grep -E '^[0-9]+ examples, [0-9]+ failures' "$output" | tail -1)
+echo "${summary:-no summary} (expected 0 failures)"
+case "$summary" in
+  *", 0 failures"*) ;;
+  *) echo "full test output: $output" >&2; exit 1 ;;
+esac
 
+rm -f "$output"
 echo "PASS"
