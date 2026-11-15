@@ -43,7 +43,7 @@ module Depsolve
     end
 
     def depsolve_wait_command
-      "#{depsolve_install_root}/embedded/bin/curl -sS -o /dev/null http://127.0.0.1:#{node['depsolve']['erchef_port']}/_status"
+      "#{depsolve_install_root}/embedded/bin/curl -sS --max-time 5 -o /dev/null http://127.0.0.1:#{node['depsolve']['erchef_port']}/_status"
     end
   end
 end

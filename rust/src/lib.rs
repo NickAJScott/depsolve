@@ -18,6 +18,7 @@
 //!   forcing the cookbook into the solution.
 //! * `timeout_ms` (optional) bounds the solve; without it the solver runs to completion.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString};
 use std::fmt;
@@ -229,6 +230,8 @@ type Offline = OfflineDependencyProvider<Package, Ranges<Version>>;
 /// The in-memory universe, plus an optional deadline that cancels the solve.
 struct Provider {
     universe: Offline,
+    /// Position of each run-list cookbook in the run list (first mention).
+    run_list_position: BTreeMap<String, usize>,
     deadline: Option<Instant>,
 }
 
@@ -237,16 +240,25 @@ impl DependencyProvider for Provider {
     type V = Version;
     type VS = Ranges<Version>;
     type M = String;
-    type Priority = <Offline as DependencyProvider>::Priority;
+    /// Run-list position first, then the universe's own heuristic.
+    type Priority = (Reverse<usize>, <Offline as DependencyProvider>::Priority);
     type Err = DeadlineExceeded;
 
+    /// Run-list cookbooks are decided before anything else, in run-list order, so an
+    /// earlier item gets the newest version it can have before a later one is looked
+    /// at. Their dependencies follow in the order the universe's heuristic picks
+    /// (most conflicts first, then fewest candidate versions).
     fn prioritize(
         &self,
         package: &Package,
         range: &Ranges<Version>,
         statistics: &PackageResolutionStatistics,
     ) -> Self::Priority {
-        self.universe.prioritize(package, range, statistics)
+        let position = match package {
+            Package::Cookbook(name) => self.run_list_position.get(name).copied().unwrap_or(usize::MAX),
+            Package::Root => 0,
+        };
+        (Reverse(position), self.universe.prioritize(package, range, statistics))
     }
 
     /// Newest version in range, as OfflineDependencyProvider does.
@@ -400,7 +412,11 @@ fn solve_inner(problem: &Problem) -> Result<Outcome, String> {
     }
     universe.add_dependencies(Package::Root, root_version, root_dependencies(&run_list, run_list.len()));
 
-    let mut provider = Provider { universe, deadline };
+    let mut run_list_position = BTreeMap::new();
+    for (position, (name, _)) in run_list.iter().enumerate() {
+        run_list_position.entry(name.clone()).or_insert(position);
+    }
+    let mut provider = Provider { universe, run_list_position, deadline };
     match resolve(&provider, Package::Root, root_version) {
         Ok(selected) => Ok(Outcome::Ok {
             solution: selected
@@ -668,6 +684,20 @@ mod tests {
             };
             assert_eq!(unsatisfiable_run_list_item, expected);
         }
+    }
+
+    #[test]
+    fn earlier_run_list_items_get_first_pick_of_newest() {
+        // a 2.0.0 and b 2.0.0 cannot be used together; whichever comes first gets 2.0.0.
+        let cookbooks = r#""cookbooks": {
+            "a": {"1.0.0": {}, "2.0.0": {"b": "< 2.0.0"}},
+            "b": {"1.0.0": {}, "2.0.0": {"a": "< 2.0.0"}}
+        }"#;
+        let a_first = solution(&format!(r#"{{{cookbooks}, "run_list": [["a", ""], ["b", ""]]}}"#));
+        assert_eq!(a_first, BTreeMap::from([("a".into(), "2.0.0".into()), ("b".into(), "1.0.0".into())]));
+
+        let b_first = solution(&format!(r#"{{{cookbooks}, "run_list": [["b", ""], ["a", ""]]}}"#));
+        assert_eq!(b_first, BTreeMap::from([("a".into(), "1.0.0".into()), ("b".into(), "2.0.0".into())]));
     }
 
     #[test]

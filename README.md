@@ -118,7 +118,11 @@ A server package upgrade installs a new `chef_objects-<version>` directory with 
 
 ## Differences from the stock solver
 
-- **Which versions are chosen.** Both solvers return valid solutions, but not always the same one. The stock solver optimises globally and will sometimes pick an older version of a run-list cookbook to get fewer or newer dependencies. depsolve takes the newest version of each cookbook that works, in the order it decides them. In testing the two chose different versions in about 3% of small random problems and in most larger ones. Expect some nodes to resolve to different cookbook versions after the switch.
+- **Which versions are chosen.** Both solvers return valid solutions, but not always the same one.
+  - The stock solver counts how many cookbooks are at their very latest version, run-list cookbooks first, and searches for the assignment with the highest count. A cookbook one release behind scores the same as one that is years old, and when several assignments score the same it returns whichever it found.
+  - depsolve decides run-list cookbooks first, in run-list order, giving each the newest version that works with what has already been decided, then does the same for their dependencies. An earlier run-list item therefore gets first pick.
+  - In testing the two chose identical versions in 560 of 575 solvable small random problems (97%) and 15 of 31 larger layered ones. Scored by the stock solver's own count, the differing answers were a tie in 19 cases, better from the stock solver in 11 and better from depsolve in 1. In the ties depsolve's run-list cookbooks were often newer.
+  - Expect some nodes to resolve to different cookbook versions after the switch.
 - **The `message` text when there is no solution.** It is PubGrub's explanation, for example `Because foo depends on bar >2.0.0 and the run list depends on foo, the run list is forbidden.` Three of the server's twenty depsolver tests fail for this reason alone: they assert the stock message word for word.
 - **Which cookbooks `most_constrained_cookbooks` names.** depsolve lists the cookbooks for which some requirement matched no available version. On involved conflicts that may not be the same set the stock solver would name.
 - **How long a timeout takes.** The stock solver can run for up to twice `depsolver_timeout` before giving up. depsolve stops at the configured time, counted from when the worker receives the request.
@@ -135,14 +139,19 @@ Against a real server loaded with generated cookbook universes, four run lists p
 | 1,866 (layered) | 412 timeout after 5.3–5.9s, all four | 200 in 0.26–0.29s, all four |
 | 2,400 (random) | 412 timeout after 5.4s, all four | 200 in 0.26–0.29s, all four |
 
-Solver only, same generator at increasing sizes:
+One solve in a fresh worker process (the server's Ruby with the solver loaded), same generator at increasing sizes, run list of six role cookbooks:
 
-| Cookbook versions | Stock solver | depsolve engine |
-|---|---|---|
-| 182 | 0.02s | 0.0006s |
-| 630 | 0.09s | 0.0013s |
-| 1,146 | 0.52s | 0.0023s |
-| 1,881 | no answer in 60s | 0.012s |
+| Cookbook versions | Stock: time | Stock: CPU | Stock: peak memory | depsolve: time | depsolve: CPU | depsolve: peak memory |
+|---|---|---|---|---|---|---|
+| 182 | 0.010s | 0.010s | 48 MB | 0.006s | 0.006s | 32 MB |
+| 630 | 0.091s | 0.091s | 56 MB | 0.008s | 0.008s | 33 MB |
+| 1,146 | 3.4s | 3.4s | 68 MB | 0.009s | 0.009s | 34 MB |
+| 1,881 | no answer in 60s | 60s | 88 MB | 0.014s | 0.014s | 36 MB |
+
+- **CPU** is processor time used by the solve. Both solvers are single-threaded, so a solve occupies one core for its whole duration; a stock solve that times out holds a core until it gives up.
+- **Peak memory** is the worker process's highest resident size. Before solving anything a stock worker sits at 46 MB and a depsolve worker at 31 MB, and erchef keeps a pool of workers (five by default).
+- depsolve's time includes passing the problem from Ruby to the engine and back; the engine alone takes 0.0006s to 0.012s on these four.
+- The stock solver's time depends heavily on the run list: the 1,146-version universe took 3.4s with six run-list items and 60s with a different four.
 
 On 2,000 small random problems the two solvers agreed on whether a solution exists every time, and every solution from either was valid.
 
