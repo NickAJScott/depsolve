@@ -65,7 +65,7 @@ The recipe does the following, in this order:
 1. Finds the server installation (`/opt/opscode` or `/opt/cinc-project`) and its worker file.
 2. Refuses to continue if the stock worker is not one it recognises (see below).
 3. Stages the engine and the new worker in `/opt/depsolve`.
-4. Runs a self-test: the staged worker loads the engine under the server's own Ruby and solves a small problem. If this fails, the run stops and the server is untouched.
+4. Runs a self-test: the staged worker loads the engine under the server's own Ruby and checks its replies for a solvable request, an unsolvable one, an invalid run list and a timeout. If this fails, the run stops and the server is untouched.
 5. Copies the stock worker to `depselector.rb.stock` beside the original.
 6. Installs the new worker and restarts erchef (`chef-server-ctl restart opscode-erchef`), then waits for it to answer.
 
@@ -119,8 +119,9 @@ A server package upgrade installs a new `chef_objects-<version>` directory with 
 ## Differences from the stock solver
 
 - **Which versions are chosen.** Both solvers return valid solutions, but not always the same one. The stock solver optimises globally and will sometimes pick an older version of a run-list cookbook to get fewer or newer dependencies. depsolve takes the newest version of each cookbook that works, in the order it decides them. In testing the two chose different versions in about 3% of small random problems and in most larger ones. Expect some nodes to resolve to different cookbook versions after the switch.
-- **Error wording.** When there is no solution the response is still a 412 with the same fields, but `message` is PubGrub's explanation, for example: `Because foo depends on bar >2.0.0 and the run list 0.0.0 depends on foo, the run list 0.0.0 is forbidden.` `unsatisfiable_run_list_item` and `most_constrained_cookbooks` are left empty. `non_existent_cookbooks` is filled in. This is why three of the server's depsolver tests fail: they assert the stock wording word for word.
-- **Unchanged:** run-list validation errors ("no such cookbook", "no versions match the constraints on cookbook") match the stock responses exactly, the server's depsolver timeout is honoured and reported the same way, and environment cookbook constraints are applied as a filter on eligible versions, as the stock worker does.
+- **The `message` text when there is no solution.** It is PubGrub's explanation, for example `Because foo depends on bar >2.0.0 and the run list depends on foo, the run list is forbidden.` Three of the server's twenty depsolver tests fail for this reason alone: they assert the stock message word for word.
+- **Which cookbooks `most_constrained_cookbooks` names.** depsolve lists the cookbooks for which some requirement matched no available version. On involved conflicts that may not be the same set the stock solver would name.
+- **How long a timeout takes.** The stock solver can run for up to twice `depsolver_timeout` before giving up. depsolve stops at the configured time, counted from when the worker receives the request.
 
 ## Evidence
 
@@ -152,7 +153,7 @@ The generated universes are evidently harder for the stock solver than many real
 - **Tested on CINC Server 15.10.127 only.** Chef Infra Server is built from the same source and the cookbook detects its paths, but it has not been run there.
 - **Standalone and tiered installs only.** Servers deployed through Chef Automate (Habitat packages) lay files out differently and are not handled.
 - **Generated data only.** No real organisation's cookbooks have been through it.
-- **The engine's timeout has only been tested directly,** not by making a real server hit it.
+- **Timeouts are hard to provoke.** With `depsolver_timeout` lowered to 1 ms a real server returned the standard timeout response and recovered. The engine is fast enough that no test universe here reaches a realistic limit, so behaviour under a genuinely long solve is covered only by the engine's own tests.
 
 ## Development
 
@@ -169,10 +170,10 @@ cd rust && cargo test --release    # unit tests plus a differential test against
 {
   "cookbooks":   { "app": { "1.1.0": { "lib": "~> 1.0" }, "1.0.0": {} },
                    "lib": { "1.0.0": {}, "1.5.0": {}, "2.0.0": {} } },
-  "run_list":    { "app": "= 1.1.0" },
+  "run_list":    [["app", "= 1.1.0"]],
   "environment": { "lib": "< 2.0.0" },
   "timeout_ms":  5000
 }
 ```
 
-and prints an outcome whose `status` is `ok`, `unsolvable`, `invalid_run_list`, `timeout` or `error`.
+and prints an outcome whose `status` is `ok`, `unsolvable`, `invalid_run_list`, `timeout` or `error`. `run_list` may also be written as an object, `{"app": "= 1.1.0"}`, when its order does not matter.

@@ -41,6 +41,10 @@ def constraint_string(operator, version)
   "#{operator} #{version}"
 end
 
+def monotonic_ms
+  Process.clock_gettime(Process::CLOCK_MONOTONIC, :millisecond)
+end
+
 def build_problem(data)
   cookbooks = data[:all_versions].to_h do |name, versions|
     [name, versions.to_h do |version, dependencies|
@@ -50,34 +54,34 @@ def build_problem(data)
   environment = data[:environment_constraints].to_h do |name, version, op|
     [name, constraint_string(op, version)]
   end
-
-  run_list = {}
-  data[:run_list].each do |item|
+  # Run-list order is kept: it decides which item is blamed when there is no solution.
+  run_list = data[:run_list].map do |item|
     name, version, op = item
-    wanted = constraint_string(op, version)
-    existing = run_list[name]
-    # The same cookbook pinned two different ways cannot be satisfied.
-    return nil if existing && !existing.empty? && !wanted.empty? && existing != wanted
-
-    run_list[name] = wanted if existing.nil? || existing.empty?
+    [name, constraint_string(op, version)]
   end
 
-  problem = { 'cookbooks' => cookbooks, 'run_list' => run_list, 'environment' => environment }
-  problem['timeout_ms'] = data[:timeout_ms] if data[:timeout_ms]
-  problem
+  { 'cookbooks' => cookbooks, 'run_list' => run_list, 'environment' => environment }
 end
 
-def no_solution(message, non_existent = [])
-  detail = Erl::List.new([[:message, message],
-                          [:unsatisfiable_run_list_item, ''],
-                          [:non_existent_cookbooks, Erl::List.new(non_existent)],
-                          [:most_constrained_cookbooks, Erl::List.new]])
-  [:error, :no_solution, detail]
+# The API reports each most-constrained cookbook as "name = version -> [(dep op version), ...]",
+# using the first version erchef listed for it.
+def describe_most_constrained(name, data)
+  _, versions = data[:all_versions].find { |cookbook, _| cookbook == name }
+  return name if versions.nil? || versions.empty?
+
+  version, dependencies = versions.first
+  described = dependencies.map do |dependency, dep_version, op|
+    wanted = constraint_string(op, dep_version)
+    "(#{dependency} #{wanted.empty? ? '>= 0.0.0' : wanted})"
+  end
+  "#{name} = #{version} -> [#{described.join(', ')}]"
 end
 
 def solve(data)
+  received = monotonic_ms
   problem = build_problem(data)
-  return no_solution('The run list asks for two different versions of the same cookbook.') unless problem
+  # erchef's timeout covers the whole request, so take off what building the problem cost.
+  problem['timeout_ms'] = [data[:timeout_ms] - (monotonic_ms - received), 0].max if data[:timeout_ms]
 
   pointer = SOLVE.call(JSON.generate(problem))
   outcome = begin
@@ -92,7 +96,12 @@ def solve(data)
     outcome['solution'].each { |name, version| packages << [name, version.split('.').map(&:to_i)] }
     [:ok, packages]
   when 'unsolvable'
-    no_solution(outcome['explanation'], outcome['non_existent_cookbooks'])
+    most_constrained = outcome['most_constrained_cookbooks'].map { |name| describe_most_constrained(name, data) }
+    detail = Erl::List.new([[:message, outcome['explanation']],
+                            [:unsatisfiable_run_list_item, outcome['unsatisfiable_run_list_item']],
+                            [:non_existent_cookbooks, Erl::List.new(outcome['non_existent_cookbooks'])],
+                            [:most_constrained_cookbooks, Erl::List.new(most_constrained)]])
+    [:error, :no_solution, detail]
   when 'invalid_run_list'
     detail = Erl::List.new([[:non_existent_cookbooks, Erl::List.new(outcome['non_existent_cookbooks'])],
                             [:constraints_not_met, Erl::List.new(outcome['no_versions'])]])
@@ -104,19 +113,44 @@ def solve(data)
   end
 end
 
-if ARGV.first == '--self-test'
-  request = {
-    all_versions: [['app', [['1.0.0', [['lib', '1.0.0', :gte]]]]], ['lib', [['1.2.0', []], ['0.9.0', []]]]],
-    environment_constraints: [],
-    run_list: ['app'],
-    timeout_ms: 5000
-  }
-  status, packages = solve(request)
-  if status == :ok && packages.sort == [['app', [1, 0, 0]], ['lib', [1, 2, 0]]]
-    puts 'depsolve self-test passed'
-    exit 0
+# Solves a few fixed requests and checks the replies erchef would receive.
+def self_test
+  universe = [['app', [['1.0.0', [['lib', '1.0.0', :gte]]]]],
+              ['lib', [['1.2.0', []], ['0.9.0', []]]],
+              ['needy', [['2.0.0', [['lib', '5.0.0', :gt]]]]]]
+  request = lambda do |run_list, timeout_ms|
+    solve(all_versions: universe, environment_constraints: [], run_list: run_list, timeout_ms: timeout_ms)
   end
-  abort "depsolve self-test failed: #{[status, packages].inspect}"
+  failures = []
+
+  status, packages = request.call(['app'], 5000)
+  failures << "solve: #{[status, packages].inspect}" unless status == :ok && packages.sort == [['app', [1, 0, 0]], ['lib', [1, 2, 0]]]
+
+  reply = request.call(['app'], 0)
+  failures << "timeout: #{reply.inspect}" unless reply == [:error, :resolution_timeout]
+
+  status, kind, detail = request.call(%w[app needy], 5000)
+  detail = detail.to_h if detail
+  unless status == :error && kind == :no_solution &&
+         detail[:unsatisfiable_run_list_item] == '(needy >= 0.0.0)' &&
+         detail[:most_constrained_cookbooks] == ['lib = 1.2.0 -> []'] &&
+         detail[:non_existent_cookbooks] == []
+    failures << "no solution: #{[status, kind, detail].inspect}"
+  end
+
+  status, kind, detail = request.call([['app', '9.9.9']], 5000)
+  detail = detail.to_h if detail
+  unless status == :error && kind == :invalid_constraints && detail[:constraints_not_met] == ['(app = 9.9.9)']
+    failures << "invalid run list: #{[status, kind, detail].inspect}"
+  end
+
+  abort "depsolve self-test failed:\n#{failures.join("\n")}" unless failures.empty?
+  puts 'depsolve self-test passed'
+end
+
+if ARGV.first == '--self-test'
+  self_test
+  exit 0
 end
 
 receive do |m|

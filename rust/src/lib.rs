@@ -11,7 +11,9 @@
 //! ```
 //!
 //! * `cookbooks` is the universe: every cookbook version carries its own dependencies.
-//! * `run_list` is what must be installed, with a constraint per cookbook.
+//! * `run_list` is what must be installed, with a constraint per cookbook. It can also
+//!   be written as an ordered list of pairs, `[["app", "= 1.1.0"], ["lib", ""]]`. Order
+//!   does not change the solution, but it decides which item is blamed when there is none.
 //! * `environment` (optional) restricts which versions are eligible at all, without
 //!   forcing the cookbook into the solution.
 //! * `timeout_ms` (optional) bounds the solve; without it the solver runs to completion.
@@ -148,7 +150,10 @@ pub type Universe = BTreeMap<String, BTreeMap<String, BTreeMap<String, String>>>
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Problem {
     pub cookbooks: Universe,
-    pub run_list: BTreeMap<String, String>,
+    /// (cookbook, constraint) in run-list order. A cookbook may appear more than once;
+    /// its constraints then all apply.
+    #[serde(deserialize_with = "deserialize_run_list")]
+    pub run_list: Vec<(String, String)>,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
     /// Give up after this many milliseconds. No limit when absent.
@@ -156,15 +161,40 @@ pub struct Problem {
     pub timeout_ms: Option<u64>,
 }
 
+/// Accepts the run list as an ordered list of pairs or as an object. An object has no
+/// order of its own, so its items are taken alphabetically.
+fn deserialize_run_list<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<(String, String)>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum RunList {
+        Ordered(Vec<(String, String)>),
+        Unordered(BTreeMap<String, String>),
+    }
+    Ok(match RunList::deserialize(deserializer)? {
+        RunList::Ordered(items) => items,
+        RunList::Unordered(items) => items.into_iter().collect(),
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Outcome {
     /// A consistent set of cookbook versions.
     Ok { solution: BTreeMap<String, String> },
-    /// No solution exists; `explanation` is the human-readable derivation.
-    /// `non_existent_cookbooks` lists cookbooks the conflict involves that are not in
-    /// the universe at all.
-    Unsolvable { explanation: String, non_existent_cookbooks: Vec<String> },
+    /// No solution exists.
+    Unsolvable {
+        /// Human-readable derivation of the conflict.
+        explanation: String,
+        /// The first run-list item, in order, that cannot be satisfied together with
+        /// the items before it, e.g. `(foo >= 0.0.0)`. Empty if the search for it ran
+        /// out of time.
+        unsatisfiable_run_list_item: String,
+        /// Cookbooks the conflict involves that are not in the universe at all.
+        non_existent_cookbooks: Vec<String>,
+        /// Cookbooks the conflict involves that exist, but where no eligible version
+        /// matched what was required of them.
+        most_constrained_cookbooks: Vec<String>,
+    },
     /// The run list cannot be satisfied on its own terms, before any dependencies are
     /// considered: it names cookbooks that do not exist, or asks for versions that do
     /// not exist (or that the environment excludes). `no_versions` holds the offending
@@ -246,24 +276,61 @@ impl DependencyProvider for Provider {
     }
 }
 
-/// Cookbooks a failed derivation needed that have no versions in the universe at all.
-fn non_existent_cookbooks(
+/// Walks a failed derivation and collects the cookbooks for which some requirement
+/// matched no version (`without_versions`) and the cookbooks whose own dependencies
+/// took part in the conflict (`examined`).
+fn conflict_participants(
     tree: &DerivationTree<Package, Ranges<Version>, String>,
-    known: &BTreeSet<&str>,
-    found: &mut BTreeSet<String>,
+    without_versions: &mut BTreeSet<String>,
+    examined: &mut BTreeSet<String>,
 ) {
     match tree {
         DerivationTree::External(External::NoVersions(Package::Cookbook(name), _)) => {
-            if !known.contains(name.as_str()) {
-                found.insert(name.clone());
-            }
+            without_versions.insert(name.clone());
+        }
+        DerivationTree::External(External::FromDependencyOf(Package::Cookbook(name), ..)) => {
+            examined.insert(name.clone());
         }
         DerivationTree::External(_) => {}
         DerivationTree::Derived(derived) => {
-            non_existent_cookbooks(&derived.cause1, known, found);
-            non_existent_cookbooks(&derived.cause2, known, found);
+            conflict_participants(&derived.cause1, without_versions, examined);
+            conflict_participants(&derived.cause2, without_versions, examined);
         }
     }
+}
+
+/// Requirements on one cookbook, merged from every run-list item that names it.
+type RootDependencies = Vec<(Package, Ranges<Version>)>;
+
+/// The requirements of the first `count` run-list items, one entry per cookbook.
+fn root_dependencies(run_list: &[(String, Ranges<Version>)], count: usize) -> RootDependencies {
+    let mut merged: BTreeMap<&str, Ranges<Version>> = BTreeMap::new();
+    for (name, ranges) in &run_list[..count] {
+        merged
+            .entry(name.as_str())
+            .and_modify(|existing| *existing = existing.intersection(ranges))
+            .or_insert_with(|| ranges.clone());
+    }
+    merged.into_iter().map(|(name, ranges)| (Package::Cookbook(name.to_string()), ranges)).collect()
+}
+
+/// Index of the first run-list item that cannot be satisfied together with the items
+/// before it, given that the whole run list is unsolvable. Adding items never makes an
+/// unsolvable prefix solvable, so this is a binary search. None if time runs out.
+fn first_unsatisfiable_item(provider: &mut Provider, run_list: &[(String, Ranges<Version>)]) -> Option<usize> {
+    let root_version = Version::new(0, 0, 0);
+    // Invariant: the first `solvable` items are solvable, the first `unsolvable` are not.
+    let (mut solvable, mut unsolvable) = (0, run_list.len());
+    while unsolvable - solvable > 1 {
+        let middle = solvable + (unsolvable - solvable) / 2;
+        provider.universe.add_dependencies(Package::Root, root_version, root_dependencies(run_list, middle));
+        match resolve(&*provider, Package::Root, root_version) {
+            Ok(_) => solvable = middle,
+            Err(PubGrubError::NoSolution(_)) => unsolvable = middle,
+            Err(_) => return None,
+        }
+    }
+    Some(unsolvable - 1)
 }
 
 fn solve_inner(problem: &Problem) -> Result<Outcome, String> {
@@ -305,25 +372,35 @@ fn solve_inner(problem: &Problem) -> Result<Outcome, String> {
 
     let root_version = Version::new(0, 0, 0);
     let mut run_list = Vec::new();
-    let mut missing = Vec::new();
-    let mut no_versions = Vec::new();
     for (name, constraint) in &problem.run_list {
         let ranges = parse_constraint(constraint).map_err(|err| format!("run list item {name}: {err}"))?;
+        run_list.push((name.clone(), ranges));
+    }
+
+    // A run list that fails on its own terms is reported as such, as the stock solver does.
+    let mut missing = Vec::new();
+    let mut no_versions = Vec::new();
+    for (package, ranges) in root_dependencies(&run_list, run_list.len()) {
+        let Package::Cookbook(name) = package else { continue };
         match eligible.get(name.as_str()) {
-            None => missing.push(name.clone()),
+            None => missing.push(name),
             Some(versions) if !versions.iter().any(|version| ranges.contains(version)) => {
-                no_versions.push(describe_requirement(name, constraint));
+                for (item, constraint) in problem.run_list.iter().filter(|(item, _)| *item == name) {
+                    let description = describe_requirement(item, constraint);
+                    if !no_versions.contains(&description) {
+                        no_versions.push(description);
+                    }
+                }
             }
             Some(_) => {}
         }
-        run_list.push((Package::Cookbook(name.clone()), ranges));
     }
     if !missing.is_empty() || !no_versions.is_empty() {
         return Ok(Outcome::InvalidRunList { non_existent_cookbooks: missing, no_versions });
     }
-    universe.add_dependencies(Package::Root, root_version, run_list);
+    universe.add_dependencies(Package::Root, root_version, root_dependencies(&run_list, run_list.len()));
 
-    let provider = Provider { universe, deadline };
+    let mut provider = Provider { universe, deadline };
     match resolve(&provider, Package::Root, root_version) {
         Ok(selected) => Ok(Outcome::Ok {
             solution: selected
@@ -335,13 +412,28 @@ fn solve_inner(problem: &Problem) -> Result<Outcome, String> {
                 .collect(),
         }),
         Err(PubGrubError::NoSolution(mut tree)) => {
-            let known: BTreeSet<&str> = problem.cookbooks.keys().map(String::as_str).collect();
-            let mut absent = BTreeSet::new();
-            non_existent_cookbooks(&tree, &known, &mut absent);
+            // Everything below runs only after a solve has failed.
+            let (mut without_versions, mut examined) = (BTreeSet::new(), BTreeSet::new());
+            conflict_participants(&tree, &mut without_versions, &mut examined);
+            let (existing, non_existent_cookbooks): (Vec<String>, Vec<String>) =
+                without_versions.into_iter().partition(|name| problem.cookbooks.contains_key(name));
+            // A cookbook whose versions were tried and rejected also shows up as having
+            // "no (other) versions". Keep only those where nothing matched in the first place.
+            let most_constrained_cookbooks = existing.into_iter().filter(|name| !examined.contains(name)).collect();
+
             tree.collapse_no_versions();
+            // The synthetic root package is "the run list" at version 0.0.0; the version is noise.
+            let explanation = DefaultStringReporter::report(&tree).replace("the run list 0.0.0", "the run list");
+
+            let unsatisfiable_run_list_item = first_unsatisfiable_item(&mut provider, &run_list)
+                .map(|index| describe_requirement(&problem.run_list[index].0, &problem.run_list[index].1))
+                .unwrap_or_default();
+
             Ok(Outcome::Unsolvable {
-                explanation: DefaultStringReporter::report(&tree),
-                non_existent_cookbooks: absent.into_iter().collect(),
+                explanation,
+                unsatisfiable_run_list_item,
+                non_existent_cookbooks,
+                most_constrained_cookbooks,
             })
         }
         Err(PubGrubError::ErrorInShouldCancel(_)) => Ok(Outcome::Timeout {
@@ -532,11 +624,66 @@ mod tests {
                 "run_list": {"app": "= 1.0.0", "lib": "= 2.0.0"}
             }"#,
         ));
-        let Outcome::Unsolvable { explanation, non_existent_cookbooks } = outcome else {
+        let Outcome::Unsolvable { explanation, non_existent_cookbooks, .. } = outcome else {
             panic!("expected unsolvable, got {outcome:?}");
         };
         assert!(explanation.contains("app") && explanation.contains("lib"), "{explanation}");
+        assert!(!explanation.contains("0.0.0"), "{explanation}");
         assert!(non_existent_cookbooks.is_empty());
+    }
+
+    #[test]
+    fn failures_name_the_run_list_item_and_cookbooks_involved() {
+        // foo needs a newer bar than exists; "other" is fine on its own and comes first.
+        let outcome = solve(&problem(
+            r#"{
+                "cookbooks": {
+                    "foo": {"1.2.3": {"bar": "> 2.0.0"}},
+                    "bar": {"2.0.0": {"foo": "> 3.0.0"}},
+                    "other": {"1.0.0": {}}
+                },
+                "run_list": [["other", ""], ["foo", ""]]
+            }"#,
+        ));
+        let Outcome::Unsolvable { unsatisfiable_run_list_item, non_existent_cookbooks, most_constrained_cookbooks, .. } =
+            outcome
+        else {
+            panic!("expected unsolvable, got {outcome:?}");
+        };
+        assert_eq!(unsatisfiable_run_list_item, "(foo >= 0.0.0)");
+        assert_eq!(most_constrained_cookbooks, ["bar"]);
+        assert!(non_existent_cookbooks.is_empty());
+    }
+
+    #[test]
+    fn blames_the_item_that_conflicts_with_earlier_ones() {
+        let cookbooks = r#""cookbooks": {"app": {"1.0.0": {"lib": "~> 1.0"}}, "lib": {"1.0.0": {}, "2.0.0": {}}}"#;
+        for (run_list, expected) in [
+            (r#"[["app", ""], ["lib", "= 2.0.0"]]"#, "(lib = 2.0.0)"),
+            (r#"[["lib", "= 2.0.0"], ["app", ""]]"#, "(app >= 0.0.0)"),
+        ] {
+            let outcome = solve(&problem(&format!(r#"{{{cookbooks}, "run_list": {run_list}}}"#)));
+            let Outcome::Unsolvable { unsatisfiable_run_list_item, .. } = outcome else {
+                panic!("expected unsolvable, got {outcome:?}");
+            };
+            assert_eq!(unsatisfiable_run_list_item, expected);
+        }
+    }
+
+    #[test]
+    fn repeated_run_list_items_all_apply() {
+        let cookbooks = r#""cookbooks": {"lib": {"1.0.0": {}, "1.5.0": {}, "2.0.0": {}}}"#;
+        let found = solution(&format!(r#"{{{cookbooks}, "run_list": [["lib", ">= 1.2.0"], ["lib", "< 2.0.0"]]}}"#));
+        assert_eq!(found, BTreeMap::from([("lib".into(), "1.5.0".into())]));
+
+        let outcome = solve(&problem(&format!(r#"{{{cookbooks}, "run_list": [["lib", "= 1.0.0"], ["lib", "= 2.0.0"]]}}"#)));
+        assert_eq!(
+            outcome,
+            Outcome::InvalidRunList {
+                non_existent_cookbooks: vec![],
+                no_versions: vec!["(lib = 1.0.0)".into(), "(lib = 2.0.0)".into()],
+            }
+        );
     }
 
     #[test]
