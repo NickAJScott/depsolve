@@ -5,10 +5,17 @@
 # erchef keeps a pool of these workers and talks to each over an Erlang port. This
 # version speaks the same protocol and returns the same reply shapes, but solves with
 # the depsolve Rust engine (PubGrub) instead of dep_selector/Gecode. Nothing on the
-# Erlang side changes. Install and remove it with depsolve-patch (see README).
+# Erlang side changes. Installed and removed by the depsolve cookbook.
+#
+#   ruby depselector.rb --self-test   load the engine, solve one problem, exit 0 or 1
+#
+# Environment:
+#   DEPSOLVE_LIB         path of the engine library (default /opt/depsolve/libdepsolve_rust.so)
+#   DEPSOLVE_BUNDLE_DIR  directory holding the server's depselector Gemfile (default:
+#                        the directory this file is in)
 
 # The server's Gemfile must be in the cwd for bundler/setup, as in the original.
-Dir.chdir(File.dirname(File.realpath(__FILE__)))
+Dir.chdir(ENV.fetch('DEPSOLVE_BUNDLE_DIR') { File.dirname(File.realpath(__FILE__)) })
 
 require 'rubygems'
 require 'bundler/setup'
@@ -95,6 +102,21 @@ def solve(data)
   else
     [:error, :exception, outcome['message'].to_s, Erl::List.new]
   end
+end
+
+if ARGV.first == '--self-test'
+  request = {
+    all_versions: [['app', [['1.0.0', [['lib', '1.0.0', :gte]]]]], ['lib', [['1.2.0', []], ['0.9.0', []]]]],
+    environment_constraints: [],
+    run_list: ['app'],
+    timeout_ms: 5000
+  }
+  status, packages = solve(request)
+  if status == :ok && packages.sort == [['app', [1, 0, 0]], ['lib', [1, 2, 0]]]
+    puts 'depsolve self-test passed'
+    exit 0
+  end
+  abort "depsolve self-test failed: #{[status, packages].inspect}"
 end
 
 receive do |m|

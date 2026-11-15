@@ -1,15 +1,10 @@
-# A real, single-node CINC Server for end-to-end depsolver testing.
-#
-#   docker build -t depsolve-cinc-server docker/cinc-server
-#   docker run -d --name depsolve-cinc-server --privileged --hostname cinc.test \
-#     -p 127.0.0.1:8643:443 depsolve-cinc-server
+# A real, single-node CINC Server for testing the cookbook end to end. Used by test/run.sh.
 #
 # The first start runs `cinc-server-ctl reconfigure`, which takes several minutes
-# (longer under amd64 emulation). `docker logs -f depsolve-cinc-server` shows progress;
-# the server is ready when it prints "cinc-server ready".
+# (longer under amd64 emulation). The server is ready when the container log shows
+# "cinc-server ready".
 #
-# --privileged is needed because reconfigure sets kernel parameters for PostgreSQL
-# and OpenSearch.
+# Run it with --privileged: reconfigure sets kernel parameters for PostgreSQL and OpenSearch.
 FROM --platform=linux/amd64 ubuntu:24.04
 
 ARG CINC_SERVER_VERSION=15.10.127

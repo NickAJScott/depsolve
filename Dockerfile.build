@@ -1,0 +1,15 @@
+# Builds libdepsolve_rust.so against an old glibc (2.28, from EL8) so the one binary
+# loads on RHEL/Rocky/Alma 8+, Amazon Linux 2023, Ubuntu 20.04+, Debian 11+ and SLES 15.
+# Used by build.sh.
+FROM rockylinux:8 AS build
+RUN dnf install -y gcc && dnf clean all
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+ENV PATH=/root/.cargo/bin:$PATH
+WORKDIR /build
+COPY rust/Cargo.toml rust/Cargo.lock ./
+COPY rust/src ./src
+COPY rust/tests ./tests
+RUN cargo test --release --locked && cargo build --release --locked
+
+FROM scratch
+COPY --from=build /build/target/release/libdepsolve_rust.so /libdepsolve_rust.so

@@ -1,163 +1,178 @@
 # depsolve
 
-A replacement dependency solver for Chef/CINC cookbooks, built on the [`pubgrub`](https://crates.io/crates/pubgrub) crate (the same PubGrub implementation uv uses for Python).
+A faster dependency solver for Chef Infra Server and CINC Server, with a cookbook that installs it on a live server.
 
-The goal is a server-side solver that stays fast on large cookbook universes, where CINC Server's current solver (`dep_selector` on Gecode) can hit its 5 second timeout, and that explains itself readably when no solution exists. PubGrub learns the cause of each conflict and jumps straight back to the decision that mattered, instead of searching for a globally best assignment.
+When a node asks the server which cookbook versions to use, the stock solver (`dep_selector` on Gecode) searches for a globally best assignment. On large or tangled cookbook universes that search can run out of time, and the node gets `412 unable to solve dependencies in alotted time`. depsolve replaces the solver with [PubGrub](https://crates.io/crates/pubgrub), the algorithm uv uses for Python packages. It finds a valid, newest-leaning answer in milliseconds and explains conflicts in plain sentences.
 
-## Layout
+## How it works
+
+The server (erchef) does not solve dependencies itself. It keeps a pool of Ruby worker processes and sends each solve to one of them. The worker is a single file:
+
+```
+<install root>/embedded/service/opscode-erchef/lib/chef_objects-<version>/priv/depselector_rb/depselector.rb
+```
+
+depsolve swaps that file for [its own worker](cookbook/depsolve/files/default/depselector.rb), which speaks the same protocol to erchef but calls the depsolve engine, a small shared library written in Rust. Nothing else on the server changes: no Erlang code, no configuration, no database.
+
+The servers need nothing extra installed. The engine is one self-contained file (`libdepsolve_rust.so`, about 1 MB) that the cookbook delivers, and the worker runs on the Ruby the server already embeds. Rust is only needed to build the library, and `build.sh` does that inside Docker.
+
+## Repository layout
 
 | Path | What it is |
 |---|---|
-| [rust/src/lib.rs](rust/src/lib.rs) | The engine: Chef versions and constraints, the solver, and a C ABI (`depsolve_solve` / `depsolve_free`) |
-| [rust/src/bin/depsolve.rs](rust/src/bin/depsolve.rs) | CLI: JSON problem in (file or stdin), JSON outcome out |
-| [src/depsolver/model.py](src/depsolver/model.py) | Python mirror of the problem model, plus `check_solution` |
-| [src/depsolver/baseline.py](src/depsolver/baseline.py) | Brute-force reference solver, used only as a correctness oracle |
-| [src/depsolver/native.py](src/depsolver/native.py) | ctypes binding to the Rust engine |
-| [src/depsolver/benchmarks.py](src/depsolver/benchmarks.py) | Synthetic scenarios and timing harness |
-| [src/depsolver/cinc_compare.py](src/depsolver/cinc_compare.py) | Runs the engine and CINC Server's own solver on the same problems |
-| [docker/cinc-baseline/](docker/cinc-baseline/) | Image holding CINC Server's solver and the engine side by side |
-| [docker/cinc-server/](docker/cinc-server/) | A real single-node CINC Server in a container |
-| [cinc-patch/](cinc-patch/) | Replacement erchef depsolver worker and the script that switches it in and out |
-| [src/depsolver/cinc_server.py](src/depsolver/cinc_server.py) | Uploads generated universes to the server and compares stock and patched workers |
-| [ruby/solver_bridge.rb](ruby/solver_bridge.rb) | Ruby binding to the Rust engine (Fiddle) |
+| [rust/](rust/) | The engine: Chef versions and constraints, the solver, a C interface, and tests |
+| [cookbook/depsolve/](cookbook/depsolve/) | Cookbook that installs (`depsolve`) or removes (`depsolve::remove`) the worker |
+| [build.sh](build.sh) | Builds the engine for Linux in Docker and places it in the cookbook |
+| [test/](test/) | End-to-end test against a real CINC Server in Docker |
 
-## Problem format
+## Deploying
 
-Every component speaks the same JSON:
+### 1. Build the engine
+
+```bash
+./build.sh                                  # x86_64 servers
+DEPSOLVE_PLATFORM=linux/arm64 ./build.sh    # aarch64 servers
+```
+
+This needs Docker and nothing else. It runs the engine's tests, then writes `cookbook/depsolve/files/default/libdepsolve_rust.so`. The library is built against glibc 2.28, so one build should load on RHEL, Rocky and Alma 8 or later, Amazon Linux 2023, Ubuntu 20.04 or later, Debian 11 or later, and SLES 15. It has been loaded on Ubuntu 24.04; the cookbook's self-test will catch a server where it does not load.
+
+The library is not committed to git. Build it before uploading the cookbook, or host it somewhere and point the cookbook at it (see `library_url` below).
+
+### 2. Run the cookbook on each server
+
+The cookbook has to run on the Chef Infra Server machines themselves, on every node that runs erchef (each frontend in a tiered or HA setup).
+
+If the servers are already managed by Chef, upload the cookbook and add `recipe[depsolve]` to their run lists:
+
+```bash
+knife cookbook upload depsolve --cookbook-path cookbook
+```
+
+Otherwise, copy `cookbook/` to the server and run it once with the client the server embeds:
+
+```bash
+# Chef Infra Server
+sudo /opt/opscode/embedded/bin/chef-client --local-mode --chef-license accept \
+    --config-option cookbook_path=/path/to/cookbook --override-runlist 'recipe[depsolve]'
+
+# CINC Server
+sudo /opt/cinc-project/embedded/bin/cinc-client --local-mode \
+    --config-option cookbook_path=/path/to/cookbook --override-runlist 'recipe[depsolve]'
+```
+
+The recipe does the following, in this order:
+
+1. Finds the server installation (`/opt/opscode` or `/opt/cinc-project`) and its worker file.
+2. Refuses to continue if the stock worker is not one it recognises (see below).
+3. Stages the engine and the new worker in `/opt/depsolve`.
+4. Runs a self-test: the staged worker loads the engine under the server's own Ruby and solves a small problem. If this fails, the run stops and the server is untouched.
+5. Copies the stock worker to `depselector.rb.stock` beside the original.
+6. Installs the new worker and restarts erchef (`chef-server-ctl restart opscode-erchef`), then waits for it to answer.
+
+The restart interrupts the API on that server for a few seconds. In a multi-frontend setup, converge one frontend at a time.
+
+Later runs change nothing unless the engine or worker has changed.
+
+### The stock worker check
+
+The recipe only replaces a stock worker whose SHA-256 it knows, because a different stock worker may mean that server version talks to its workers differently. The list ships with one entry, the worker from CINC Server 15.10.127, which is the only version this has been tested on.
+
+On any other version the first run stops with a message that includes the checksum it found. Before overriding it, run the test rig against that version if you can (set `CINC_SERVER_VERSION` and `CINC_SERVER_SHA256` in [test/cinc-server/Dockerfile](test/cinc-server/Dockerfile)), or compare your server's `depselector.rb` with the one in that image. Then either add the checksum to `node['depsolve']['known_stock_checksums']` or set `node['depsolve']['allow_unknown_stock_worker']` to `true`.
+
+### Attributes
+
+| Attribute | Default | Purpose |
+|---|---|---|
+| `['depsolve']['install_root']` | detected | Server install directory, if it is not `/opt/opscode` or `/opt/cinc-project` |
+| `['depsolve']['library_url']` | `nil` | Download the engine from here instead of shipping it in the cookbook |
+| `['depsolve']['library_checksum']` | `nil` | SHA-256 of the engine; required with `library_url` |
+| `['depsolve']['known_stock_checksums']` | CINC 15.10.127 | Stock workers the recipe will replace |
+| `['depsolve']['allow_unknown_stock_worker']` | `false` | Replace an unrecognised stock worker anyway |
+| `['depsolve']['restart_command']` | `chef-server-ctl restart opscode-erchef` | How to restart erchef |
+| `['depsolve']['erchef_port']` | `8000` | Port polled after the restart |
+
+### Checking it worked
+
+```bash
+grep -c libdepsolve_rust /opt/opscode/embedded/service/opscode-erchef/lib/chef_objects-*/priv/depselector_rb/depselector.rb   # 1 when installed
+sudo chef-server-ctl test --focus depsolver    # the server's own depsolver API tests
+```
+
+With depsolve installed, three of the twenty depsolver tests fail. That is expected; see Differences.
+
+### Rolling back
+
+Run `recipe[depsolve::remove]` the same way. It restores the stock worker, restarts erchef and deletes `/opt/depsolve`.
+
+By hand, if needed:
+
+```bash
+cd /opt/opscode/embedded/service/opscode-erchef/lib/chef_objects-*/priv/depselector_rb
+sudo cp -p depselector.rb.stock depselector.rb
+sudo chef-server-ctl restart opscode-erchef
+```
+
+### Server upgrades
+
+A server package upgrade installs a new `chef_objects-<version>` directory with a stock worker in it, so the server goes back to the stock solver until the cookbook runs again. If the new version's stock worker has a different checksum, the recipe stops and asks you to confirm it, as above.
+
+## Differences from the stock solver
+
+- **Which versions are chosen.** Both solvers return valid solutions, but not always the same one. The stock solver optimises globally and will sometimes pick an older version of a run-list cookbook to get fewer or newer dependencies. depsolve takes the newest version of each cookbook that works, in the order it decides them. In testing the two chose different versions in about 3% of small random problems and in most larger ones. Expect some nodes to resolve to different cookbook versions after the switch.
+- **Error wording.** When there is no solution the response is still a 412 with the same fields, but `message` is PubGrub's explanation, for example: `Because foo depends on bar >2.0.0 and the run list 0.0.0 depends on foo, the run list 0.0.0 is forbidden.` `unsatisfiable_run_list_item` and `most_constrained_cookbooks` are left empty. `non_existent_cookbooks` is filled in. This is why three of the server's depsolver tests fail: they assert the stock wording word for word.
+- **Unchanged:** run-list validation errors ("no such cookbook", "no versions match the constraints on cookbook") match the stock responses exactly, the server's depsolver timeout is honoured and reported the same way, and environment cookbook constraints are applied as a filter on eligible versions, as the stock worker does.
+
+## Evidence
+
+Measured on CINC Server 15.10.127 in Docker, on an arm64 Mac under amd64 emulation.
+
+Against a real server loaded with generated cookbook universes, four run lists per organisation:
+
+| Cookbook versions in the organisation | Stock worker | depsolve worker |
+|---|---|---|
+| 1,881 (layered: libraries, applications, roles) | 412 timeout after 5.3s, all four | 200 in 0.26–0.28s, all four |
+| 1,866 (layered) | 412 timeout after 5.3–5.9s, all four | 200 in 0.26–0.29s, all four |
+| 2,400 (random) | 412 timeout after 5.4s, all four | 200 in 0.26–0.29s, all four |
+
+Solver only, same generator at increasing sizes:
+
+| Cookbook versions | Stock solver | depsolve engine |
+|---|---|---|
+| 182 | 0.02s | 0.0006s |
+| 630 | 0.09s | 0.0013s |
+| 1,146 | 0.52s | 0.0023s |
+| 1,881 | no answer in 60s | 0.012s |
+
+On 2,000 small random problems the two solvers agreed on whether a solution exists every time, and every solution from either was valid.
+
+The generated universes are evidently harder for the stock solver than many real ones, so these numbers show where it fails, not how often a given server will hit it. The scripts that produced them are in the repository's first commit.
+
+## Limits
+
+- **Tested on CINC Server 15.10.127 only.** Chef Infra Server is built from the same source and the cookbook detects its paths, but it has not been run there.
+- **Standalone and tiered installs only.** Servers deployed through Chef Automate (Habitat packages) lay files out differently and are not handled.
+- **Generated data only.** No real organisation's cookbooks have been through it.
+- **The engine's timeout has only been tested directly,** not by making a real server hit it.
+
+## Development
+
+```bash
+cd rust && cargo test --release    # unit tests plus a differential test against brute force
+./test/run.sh                      # end-to-end against CINC Server in Docker
+```
+
+`test/run.sh` builds the engine, starts a CINC Server container (about ten minutes the first time), converges the cookbook twice, runs the server's depsolver API tests, removes the cookbook and runs them again. It expects exactly the three wording failures with depsolve installed and none after removal.
+
+`rust/src/bin/depsolve.rs` is a command-line front end for trying the engine directly. It reads a problem as JSON:
 
 ```json
 {
   "cookbooks":   { "app": { "1.1.0": { "lib": "~> 1.0" }, "1.0.0": {} },
                    "lib": { "1.0.0": {}, "1.5.0": {}, "2.0.0": {} } },
   "run_list":    { "app": "= 1.1.0" },
-  "environment": { "lib": "< 2.0.0" }
+  "environment": { "lib": "< 2.0.0" },
+  "timeout_ms":  5000
 }
 ```
 
-- `cookbooks` is the universe. Each cookbook *version* has its own dependencies.
-- `run_list` is what must be installed, with one constraint per cookbook.
-- `environment` is optional. It restricts which versions are eligible without forcing the cookbook into the solution.
-
-Versions are `x.y` or `x.y.z`, numeric only. Constraints are a single Chef operator and a version: `=`, `>`, `>=`, `<`, `<=`, `~>`. A bare version means `=`, and an empty string means any version. `~> 1.2` allows `>= 1.2.0, < 2.0.0`; `~> 1.2.3` allows `>= 1.2.3, < 1.3.0`.
-
-The outcome is one of:
-
-```json
-{ "status": "ok", "solution": { "app": "1.1.0", "lib": "1.5.0" } }
-{ "status": "unsolvable", "explanation": "Because ... , version solving failed." }
-{ "status": "error", "message": "app 1.0.0 depends on lib: invalid constraint ..." }
-```
-
-`unsolvable` means the input was well formed but has no solution, including a dependency on a cookbook that is not in the universe. `error` means the input itself was malformed.
-
-## Build and test
-
-```bash
-cargo build --release --manifest-path rust/Cargo.toml
-cargo test --release --manifest-path rust/Cargo.toml
-python3 -m pytest -q
-```
-
-The Python tests that need the Rust library are skipped if it has not been built, and the CINC comparison test is skipped unless the Docker image exists. The tests include a differential fuzz: 3,000 random problems where the engine must agree with the brute-force baseline on solvability, and every solution it returns is independently validated.
-
-## Comparison with CINC Server's solver
-
-The target is the server-side depsolver. In CINC Server 15.10.127, erchef hands each solve to a Ruby worker (`depselector.rb`) that uses the `dep_selector` gem on Gecode, with a 5 second timeout by default.
-
-[docker/cinc-baseline/Dockerfile](docker/cinc-baseline/Dockerfile) unpacks the official CINC Server package (nothing is installed or started) and drives that same gem bundle and Gecode build through [cinc_solve.rb](docker/cinc-baseline/cinc_solve.rb), which builds the graph the way `depselector.rb` does. The Rust engine is compiled into the same image, so both run in one environment.
-
-```bash
-docker build -f docker/cinc-baseline/Dockerfile -t depsolve-cinc-baseline .
-PYTHONPATH=src python3 -m depsolver.cinc_compare
-```
-
-CINC Server is published for amd64 only. On an arm64 host the image runs under emulation, which slows both solvers alike.
-
-### Agreement
-
-On 2,000 small random problems (arm64 Mac, emulated):
-
-| | |
-|---|---|
-| Both found a solution | 575 |
-| ...with identical versions | 557 |
-| Both found no solution | 1,425 |
-| Disagreements on solvability | 0 |
-| Invalid solutions from either | 0 |
-| Median time per problem | CINC 0.30ms, Rust 0.014ms |
-
-The 18 differing solutions are all valid. They differ because the two solvers prefer different things: `dep_selector` searches for a globally best assignment and will take an older run-list cookbook to pull in fewer or newer dependencies, while the engine takes the newest version of each cookbook in the order it decides them.
-
-### Timing
-
-| Scenario | CINC Server | Rust engine |
-|---|---|---|
-| late pin, 5 cookbooks × 10 versions | 0.0011s | 0.0005s |
-| late pin, 8 × 20 | 0.0050s | 0.0031s |
-| late pin, 50 × 50 | 0.088s | 0.096s |
-| random universe, 30 cookbooks × 9 versions | 0.053s | 0.0007s |
-| random universe, 200 × 12 | timeout (5s) | 0.0045s |
-| random universe, 1000 × 12 | timeout (5s) | 0.093s |
-
-Two things follow. The late-pin chain is not a problem for CINC's solver: Gecode's constraint propagation handles it as well as PubGrub does. Where CINC's solver falls over is large, tangled universes, where its search for the best assignment runs out of time while the engine returns a valid answer in milliseconds. These universes are synthetic, so this shows where the difference lies, not how large it is on real data.
-
-The brute-force baseline can be timed against the engine on the host with `PYTHONPATH=src python3 -m depsolver.benchmarks`. It is a correctness oracle, not a performance reference.
-
-## Patching CINC Server
-
-erchef does not solve dependencies itself. It keeps a pool of Ruby worker processes (`priv/depselector_rb/depselector.rb` in the `chef_objects` application) and sends each solve to one over an Erlang port. That worker is the patch point: [cinc-patch/depselector.rb](cinc-patch/depselector.rb) speaks the same port protocol and returns the same reply shapes, but calls the Rust engine instead of `dep_selector`. No Erlang code changes.
-
-```bash
-depsolve-patch enable    # install the worker, restart erchef
-depsolve-patch disable   # restore the stock worker, restart erchef
-depsolve-patch status
-```
-
-The script expects `depselector.rb` and `libdepsolve_rust.so` in `/opt/depsolve/` on the server. The stock worker is kept beside the replacement as `depselector.rb.stock`.
-
-### End-to-end test
-
-```bash
-docker build -t depsolve-cinc-server docker/cinc-server
-docker run -d --name depsolve-cinc-server --privileged --hostname cinc.test \
-    -p 127.0.0.1:8643:443 depsolve-cinc-server      # wait for "cinc-server ready" in the logs
-PYTHONPATH=src python3 -m depsolver.cinc_server
-```
-
-This uploads three generated universes into three organisations, then sends the same run lists to the server's depsolve endpoint (`POST /organizations/ORG/environments/_default/cookbook_versions`) with the stock worker and with the patched one. Cookbook versions are uploaded as metadata only (name, version, dependencies), which is all the depsolver reads. It finishes with the stock worker restored.
-
-Results on CINC Server 15.10.127 (arm64 Mac, emulated), four run lists per organisation:
-
-| Organisation | Cookbook versions | Stock worker | Patched worker |
-|---|---|---|---|
-| layered1 | 1,881 | 412 timeout after 5.3s, all four | 200 in 0.26–0.28s, all four |
-| layered2 | 1,866 | 412 timeout after 5.3–5.9s, all four | 200 in 0.26–0.29s, all four |
-| random200 | 2,400 | 412 timeout after 5.4s, all four | 200 in 0.26–0.28s, all four |
-
-Every answer from the patched worker passes `check_solution`. Most of its 0.27s is the HTTP round trip and the server fetching the universe; the solve itself takes about 10ms. Unsolvable run lists come back as the usual 412, with PubGrub's explanation in `message`.
-
-The stock failures are not only the 5 second limit. Run directly with a 60 second budget, `dep_selector` still does not finish on the layered1 universe. On smaller universes from the same generator it does finish, with time growing steeply:
-
-| Layered universe | CINC solver | Rust engine |
-|---|---|---|
-| 182 versions | 0.02s | 0.0006s |
-| 326 versions | 0.03s | 0.0009s |
-| 630 versions | 0.09s | 0.0013s |
-| 1,146 versions | 0.52s | 0.0023s |
-| 1,881 versions | no answer in 60s | 0.012s |
-
-Production servers with thousands of cookbook versions do solve with the stock worker, so the generated universes are evidently harder for it than typical real ones. Treat these numbers as showing the failure mode, not its frequency.
-
-### Known gaps in the patch
-
-- **No timeout.** The engine has no time limit of its own. erchef still kills a worker that takes more than twice `depsolver_timeout`, but the engine should enforce the limit itself (the `pubgrub` crate has a cancellation hook).
-- **Different answers.** Where both solvers succeed on the layered universes, they usually choose different valid versions (see Agreement above).
-- **Error detail.** On failure erchef's response has `unsatisfiable_run_list_item`, `non_existent_cookbooks` and `most_constrained_cookbooks`. The patched worker fills in `message` only and leaves the others empty. A run list constrained to no versions is reported as "no solution" rather than "invalid constraints".
-- **Still a Ruby process.** The worker keeps the Ruby runtime and the JSON hop. Calling the engine from Erlang directly (a NIF) would remove both, at the cost of changing and rebuilding erchef.
-- **Not run against the server's own API test suite** (oc-chef-pedant has depsolver specs).
-
-## Not done yet
-
-- **Real data.** All universes are generated. A real organisation's cookbooks, run lists and environment constraints would show how often the stock solver actually struggles and how often answers differ.
-- **Version preference.** About 3% of solvable fuzz cases get a different (valid) answer from CINC's solver. A drop-in replacement has to decide whether to reproduce CINC's preference or accept the difference. The run list is also an unordered map here, while erchef passes an ordered list.
-- **Environments.** The end-to-end test only uses the `_default` environment. Environment constraints are covered by the unit and fuzz tests, not through the server.
+and prints an outcome whose `status` is `ok`, `unsolvable`, `invalid_run_list`, `timeout` or `error`.
