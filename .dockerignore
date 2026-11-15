@@ -1,0 +1,5 @@
+*
+!rust/Cargo.toml
+!rust/Cargo.lock
+!rust/src
+!docker/cinc-baseline/cinc_solve.rb

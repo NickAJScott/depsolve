@@ -1,0 +1,16 @@
+[package]
+name = "depsolve-rust"
+version = "0.1.0"
+edition = "2021"
+description = "Chef/CINC cookbook dependency solver built on the pubgrub crate"
+license = "Apache-2.0"
+
+[lib]
+name = "depsolve_rust"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pubgrub = "0.4.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

@@ -1,0 +1,14 @@
+#!/bin/sh
+# Stand-in for systemctl inside the container.
+#
+# `cinc-server-ctl reconfigure` registers the runit supervisor as a systemd unit and
+# checks its state. There is no systemd here; start-cinc-server launches the supervisor
+# directly. This shim reports the unit as loaded, enabled and running, and accepts
+# every other command without doing anything.
+for argument in "$@"; do
+  if [ "$argument" = "show" ]; then
+    printf 'LoadState=loaded\nActiveState=active\nSubState=running\nUnitFileState=enabled\n'
+    exit 0
+  fi
+done
+exit 0

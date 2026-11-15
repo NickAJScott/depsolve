@@ -1,0 +1,50 @@
+#!/bin/sh
+# Switches a CINC Server between its stock depsolver worker and the depsolve engine.
+#
+#   depsolve-patch enable    install the PubGrub worker and restart erchef
+#   depsolve-patch disable   restore the stock worker and restart erchef
+#   depsolve-patch status    say which worker is installed
+#
+# Expects /opt/depsolve/depselector.rb and /opt/depsolve/libdepsolve_rust.so.
+set -eu
+
+PRIV=$(echo /opt/cinc-project/embedded/service/opscode-erchef/lib/chef_objects-*/priv/depselector_rb)
+WORKER="$PRIV/depselector.rb"
+STOCK="$PRIV/depselector.rb.stock"
+
+# erchef keeps long-lived worker processes, so it has to be restarted to pick up a
+# different worker. Falls back to a forced restart if the graceful one times out, then
+# waits until erchef answers again.
+restart_erchef() {
+  cinc-server-ctl restart opscode-erchef >/dev/null 2>&1 ||
+    /opt/cinc-project/embedded/bin/sv -w 15 force-restart /opt/cinc-project/service/opscode-erchef >/dev/null 2>&1 || true
+  for _ in $(seq 1 90); do
+    if curl -fs -o /dev/null http://127.0.0.1:8000/_status; then return 0; fi
+    sleep 2
+  done
+  echo "erchef did not come back within 180s" >&2
+  exit 1
+}
+
+case "${1:-status}" in
+  enable)
+    [ -f /opt/depsolve/libdepsolve_rust.so ] || { echo "missing /opt/depsolve/libdepsolve_rust.so" >&2; exit 1; }
+    [ -f "$STOCK" ] || cp -p "$WORKER" "$STOCK"
+    cp /opt/depsolve/depselector.rb "$WORKER"
+    restart_erchef
+    echo "depsolve worker enabled"
+    ;;
+  disable)
+    [ -f "$STOCK" ] || { echo "stock worker was never replaced"; exit 0; }
+    cp -p "$STOCK" "$WORKER"
+    restart_erchef
+    echo "stock worker restored"
+    ;;
+  status)
+    if grep -q libdepsolve_rust "$WORKER"; then echo "depsolve worker"; else echo "stock worker"; fi
+    ;;
+  *)
+    echo "usage: depsolve-patch enable|disable|status" >&2
+    exit 2
+    ;;
+esac

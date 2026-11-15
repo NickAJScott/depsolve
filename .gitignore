@@ -1,0 +1,7 @@
+rust/target/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+/dist/
+cookbook/depsolve/files/default/libdepsolve_rust.so
+.DS_Store
