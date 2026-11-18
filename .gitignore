@@ -5,3 +5,5 @@ __pycache__/
 /dist/
 cookbook/depsolve/files/default/libdepsolve_rust.so
 .DS_Store
+simulator/target/
+simulator/*.local.md

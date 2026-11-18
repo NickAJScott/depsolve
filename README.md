@@ -24,6 +24,7 @@ The servers need nothing extra installed. The engine is one self-contained file 
 | [cookbook/depsolve/](cookbook/depsolve/) | Cookbook that installs (`depsolve`) or removes (`depsolve::remove`) the worker |
 | [build.sh](build.sh) | Builds the engine for Linux in Docker and places it in the cookbook |
 | [test/](test/) | End-to-end test against a real CINC Server in Docker |
+| [simulator/](simulator/) | Simulates the server's depsolver worker pool under fleet load, to see when slow solves cause 503 spikes ([README](simulator/README.md)) |
 
 ## Deploying
 

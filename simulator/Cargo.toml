@@ -1,0 +1,15 @@
+[package]
+name = "depsolve-simulator"
+version = "0.1.0"
+edition = "2021"
+description = "Discrete-event simulator of erchef's depsolver worker pool under chef-client load"
+license = "Apache-2.0"
+
+[[bin]]
+name = "simulate"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
